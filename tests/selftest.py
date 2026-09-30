@@ -745,6 +745,9 @@ def run_checks():
     run_plan_checks(call, check, conflict_aid)
     run_plan_fuzz(check)
 
+    # -- remediation plan checks ---------------------------------------------
+    run_remediation_checks(call, check)
+
     # -- assessment comparison checks ----------------------------------------
     run_compare_checks(call, check)
 
@@ -2138,6 +2141,314 @@ def run_plan_fuzz(check):
                       "oracle", best, "exhaustive", got_e[0], "bnb", got_b[0])
     check("plan fuzz: branch-and-bound == exhaustive == brute force",
           mismatches == 0, "%d mismatches" % mismatches)
+
+
+def run_remediation_checks(call, check):
+    """End-to-end checks for POST /v1/assessments/{id}/remediation-plan."""
+    # Fixture: an unavoidable GPL-2.0-only / Apache-2.0 incompatibility
+    # (both statically linked into app); docs is an unrelated component.
+    req = {
+        "product": "clash",
+        "components": [
+            {"id": "app", "name": "App", "version": "1", "license": "MIT"},
+            {"id": "libg", "name": "G", "version": "2",
+             "license": "GPL-2.0-only", "linkage": "static"},
+            {"id": "libap", "name": "A", "version": "3",
+             "license": "Apache-2.0", "linkage": "static"},
+            {"id": "docs", "license": "CC0-1.0"},
+        ],
+        "dependencies": [
+            {"from": "app", "to": "libg"},
+            {"from": "app", "to": "libap"},
+        ],
+    }
+    code, body = call("POST", "/v1/assessments", req)
+    aid = body.get("id")
+    check("remediation: fixture conflicts",
+          code == 200 and body["result"]["status"] == "conflict")
+
+    # -- releasable optimum: cheapest fix, global not per-component ----------
+    plan_body = {"components": {
+        "libap": [
+            {"id": "mit", "expression": "MIT", "cost": 5},
+            {"id": "isc", "expression": "ISC", "cost": 8},
+        ],
+        "libg": [{"id": "mit", "expression": "MIT", "cost": 10}],
+    }}
+    code, body = call("POST", "/v1/assessments/%s/remediation-plan" % aid, plan_body)
+    check("remediation: releasable 200", code == 200, str(body)[:200])
+    check("remediation: release true", body.get("release") is True)
+    check("remediation: cheapest global fix",
+          body.get("total_cost") == 5 and body.get("changed_components") == 1,
+          str((body.get("total_cost"), body.get("changed_components"))))
+    check("remediation: replacement list",
+          [(r["component"], r["candidate_id"]) for r in body.get("replacements", [])]
+          == [("libap", "mit")])
+    sel = {(s["component"]): s for s in body.get("selection", [])}
+    check("remediation: every component appears in selection",
+          sorted(sel) == ["app", "docs", "libap", "libg"])
+    check("remediation: kept components are zero-cost keep",
+          sel["libg"]["candidate_id"] == "keep" and sel["libg"]["cost"] == 0
+          and sel["libg"]["changed"] is False
+          and sel["app"]["candidate_id"] == "keep")
+    check("remediation: recomputed release conclusion",
+          body.get("reassessed", {}).get("status") == "ok"
+          and body.get("reassessed", {}).get("release") is True
+          and body.get("adopted", {}).get("libap") == "MIT"
+          and "attribution" in body.get("artifact_obligations", []))
+    check("remediation: from_expression preserved",
+          body["replacements"][0]["from_expression"] == "Apache-2.0")
+    check("remediation: hash present",
+          isinstance(body.get("remediation_hash"), str)
+          and len(body["remediation_hash"]) == 64)
+    h1 = body["remediation_hash"]
+
+    # -- order independence: shuffle components and candidates --------------
+    shuffled = {"components": {
+        "libg": [{"id": "mit", "expression": "MIT", "cost": 10}],
+        "libap": [
+            {"id": "isc", "expression": "ISC", "cost": 8},
+            {"id": "mit", "expression": "MIT", "cost": 5},
+        ],
+    }}
+    code, body2 = call("POST", "/v1/assessments/%s/remediation-plan" % aid, shuffled)
+    check("remediation: order independent",
+          code == 200 and body2.get("remediation_hash") == h1
+          and [(r["component"], r["candidate_id"]) for r in body2["replacements"]]
+          == [("libap", "mit")])
+
+    # -- tie-break: equal cost -> fewer changes; equal changes -> lexicographic
+    tie_body = {"components": {
+        "libap": [
+            {"id": "a-mit", "expression": "MIT", "cost": 5},
+            {"id": "a-isc", "expression": "ISC", "cost": 5},
+        ],
+        "libg": [{"id": "g-mit", "expression": "MIT", "cost": 5}],
+    }}
+    code, body = call("POST", "/v1/assessments/%s/remediation-plan" % aid, tie_body)
+    # any single change releases at cost 5; component-id tie-break picks
+    # libap before libg, then candidate-id tie-break picks a-isc
+    check("remediation: tie resolves uniquely",
+          code == 200 and body.get("changed_components") == 1
+          and body["replacements"][0]["component"] == "libap"
+          and body["replacements"][0]["candidate_id"] == "a-isc",
+          str(body.get("replacements")))
+
+    # -- zero-cost identical-expression candidate changes nothing -----------
+    code, body = call("POST", "/v1/assessments/%s/remediation-plan" % aid,
+                      {"components": {"app": [
+                          {"id": "same", "expression": "MIT", "cost": 0}]}})
+    check("remediation: identical expression is not a change -> still conflict 409",
+          code == 409 and body.get("ready") is False
+          and body.get("total_cost") == 0 and body.get("changed_components") == 0
+          and body.get("conflicting_components") == ["app", "libap", "libg"])
+    check("remediation: failure explains conflicts",
+          all(c["type"] in ("incompatible-licenses", "same-license-clash")
+              for c in body.get("conflicts", []))
+          and body.get("reassessed", {}).get("status") == "conflict"
+          and isinstance(body.get("remediation_hash"), str))
+    fail_hash = body["remediation_hash"]
+
+    # -- no fix: best failing plan picked by (conflict count, cost, ...) -----
+    code, body = call("POST", "/v1/assessments/%s/remediation-plan" % aid,
+                      {"components": {
+                          "libap": [{"id": "g3", "expression": "GPL-3.0-only", "cost": 1}],
+                          "docs": [{"id": "mit", "expression": "MIT", "cost": 1}]}})
+    check("remediation: hopeless change -> 409 best failure",
+          code == 409 and body.get("release") is False)
+    # paying for docs/MIT adds cost without removing conflicts, so the
+    # unique best failure keeps docs unchanged
+    docs_sel = next(s for s in body["selection"] if s["component"] == "docs")
+    check("remediation: best failure minimizes conflict count then cost",
+          docs_sel["candidate_id"] == "keep" and body.get("total_cost") == 0
+          and len(body.get("conflicting_components", [])) >= 3,
+          str((body.get("total_cost"), body.get("conflicting_components"))))
+
+    # failure hash is order-independent too
+    code, body3 = call("POST", "/v1/assessments/%s/remediation-plan" % aid,
+                       {"components": {
+                           "docs": [{"id": "mit", "expression": "MIT", "cost": 1}],
+                           "libap": [{"id": "g3", "expression": "GPL-3.0-only", "cost": 1}]}})
+    check("remediation: failure hash order independent",
+          code == 409 and body3.get("remediation_hash") == body["remediation_hash"])
+
+    # -- 422: illegal candidates never produce partial conclusions ----------
+    cases_422 = [
+        ("invalid expression", {"components": {"app": [
+            {"id": "x", "expression": "MIT AND (", "cost": 1}]}}),
+        ("unknown license", {"components": {"app": [
+            {"id": "x", "expression": "Custom-1.0", "cost": 1}]}}),
+        ("unknown exception", {"components": {"app": [
+            {"id": "x", "expression": "MIT WITH Nope-exception", "cost": 1}]}}),
+        ("unknown component", {"components": {"ghost": [
+            {"id": "x", "expression": "MIT", "cost": 1}]}}),
+        ("negative cost", {"components": {"app": [
+            {"id": "x", "expression": "MIT", "cost": -2}]}}),
+        ("duplicate candidate id", {"components": {"app": [
+            {"id": "x", "expression": "MIT", "cost": 1},
+            {"id": "x", "expression": "ISC", "cost": 2}]}}),
+        ("reserved keep id", {"components": {"app": [
+            {"id": "keep", "expression": "MIT", "cost": 1}]}}),
+        ("missing expression", {"components": {"app": [
+            {"id": "x", "cost": 1}]}}),
+    ]
+    for label, bad in cases_422:
+        code, body = call("POST", "/v1/assessments/%s/remediation-plan" % aid, bad)
+        check("remediation: 422 %s" % label, code == 422, str(body)[:120])
+
+    # -- 400: malformed envelope ---------------------------------------------
+    code, body = call("POST", "/v1/assessments/%s/remediation-plan" % aid,
+                      {"components": []})
+    check("remediation: malformed envelope 400", code == 400)
+
+    # -- 409: non-conflict assessment; 404: unknown assessment ---------------
+    code, ok_body = call("POST", "/v1/assessments",
+                         {"components": [{"id": "a", "license": "MIT"}]})
+    code, body = call("POST", "/v1/assessments/%s/remediation-plan" % ok_body["id"],
+                      {"components": {}})
+    check("remediation: non-conflict assessment 409",
+          code == 409 and body.get("reason") == "not-conflict")
+    code, body = call("POST", "/v1/assessments/%s/remediation-plan" % ("f" * 32),
+                      {"components": {}})
+    check("remediation: unknown assessment 404", code == 404)
+
+    # -- pinned snapshot: overwriting the ruleset does not change the plan ---
+    plan_before = None
+    code, plan_before = call("POST", "/v1/assessments/%s/remediation-plan" % aid,
+                             plan_body)
+    # overwrite default ruleset (draft + activate flow with a tweak that
+    # would make Apache-2.0 compatible with GPL-2.0-only if it were used)
+    code, rules_resp = call("GET", "/v1/rulesets/default")
+    active_rev = rules_resp.get("active_revision")
+    tweaked = json.loads(json.dumps(rules_resp["ruleset"]))
+    tweaked["licenses"]["Apache-2.0"]["incompatible_with"] = []
+    code, rev = call("POST", "/v1/rulesets/default/revisions",
+                     {"rules": tweaked, "base_revision": active_rev})
+    check("remediation: tweak revision drafted", code == 200)
+    code, act = call(
+        "POST", "/v1/rulesets/default/revisions/%s/activate" % rev["revision"],
+        {"expected_active_revision": active_rev})
+    check("remediation: tweak activated", code == 200, str(act)[:120])
+    code, plan_after = call("POST", "/v1/assessments/%s/remediation-plan" % aid,
+                            plan_body)
+    check("remediation: plan computed from pinned snapshot, not active rules",
+          code == 200 and plan_after["remediation_hash"] == plan_before["remediation_hash"])
+    # roll back to the original ruleset for the remaining checks
+    call("POST", "/v1/rulesets/default/revisions/%s/activate" % active_rev,
+         {"expected_active_revision": rev["revision"]})
+
+    # -- candidate OR expressions resolve against the pinned rules ----------
+    code, body = call("POST", "/v1/assessments/%s/remediation-plan" % aid,
+                      {"components": {"libap": [
+                          {"id": "dual",
+                           "expression": "Apache-2.0 OR MIT", "cost": 5}]}})
+    check("remediation: candidate OR expression re-solved to feasible branch",
+          code == 200 and body.get("release") is True
+          and body["adopted"].get("libap") == "MIT")
+
+    # -- large choice space: branch-and-bound agrees with exhaustive ---------
+    many = {"components": {
+        cid: [
+            {"id": "m%d" % k, "expression": lid, "cost": k + 1}
+            for k, lid in enumerate(["MIT", "ISC", "BSD-2-Clause"])
+        ]
+        for cid in ("app", "libap")
+    }}
+    # 4 options per component (3 + keep) over 2 components is still small;
+    # force the large path via many components: 4^7 > 4096
+    big_req = {
+        "components": [
+            {"id": "hub", "license": "GPL-2.0-only", "linkage": "static"},
+        ] + [
+            {"id": "ap%d" % i, "license": "Apache-2.0", "linkage": "static"}
+            for i in range(7)
+        ],
+        "dependencies": [
+            {"from": "hub", "to": "ap%d" % i} for i in range(7)
+        ],
+    }
+    code, big = call("POST", "/v1/assessments", big_req)
+    check("remediation: big fixture conflicts", code == 200
+          and big["result"]["status"] == "conflict")
+    big_body = {"components": {
+        "ap%d" % i: [
+            {"id": "m0", "expression": "MIT", "cost": 1},
+            {"id": "m1", "expression": "ISC", "cost": 2},
+            {"id": "m2", "expression": "BSD-2-Clause", "cost": 3},
+        ]
+        for i in range(7)
+    }}
+    code, body = call("POST", "/v1/assessments/%s/remediation-plan" % big["id"],
+                      big_body)
+    check("remediation: large space solved via branch-and-bound",
+          code == 200 and body.get("selection_mode") == "branch-and-bound"
+          and body.get("release") is True,
+          str((code, body.get("selection_mode"), body.get("total_cost"))))
+    # each GPL/Apache pair conflicts separately at hub, so all 7 Apache
+    # components must move off Apache-2.0; cheapest candidate everywhere
+    # is m0/MIT -> total 7, 7 changes, lexicographic first
+    check("remediation: large space global optimum",
+          body.get("total_cost") == 7 and body.get("changed_components") == 7
+          and [(r["component"], r["candidate_id"]) for r in body["replacements"]]
+          == [("ap%d" % i, "m0") for i in range(7)],
+          str(body.get("replacements")))
+
+    # solver-level equivalence: exhaustive vs branch-and-bound, random
+    # remediation instances must give identical normalized answers
+    import math as _math
+    import random
+    from app import remediation as rem_mod
+
+    rng = random.Random(20260930)
+    licenses_pool = ["MIT", "ISC", "Apache-2.0", "GPL-2.0-only",
+                     "GPL-3.0-only", "BSD-3-Clause", "CC0-1.0"]
+    mismatches = 0
+    for trial in range(24):
+        n = 2 + int(rng.random() * 4)
+        comps = [
+            {"id": "c%d" % i,
+             "license": licenses_pool[int(rng.random() * len(licenses_pool))],
+             "linkage": "static"}
+            for i in range(n)
+        ]
+        # one shared dependent so incompatible licenses co-exist there
+        deps = [{"from": "c%d" % j, "to": "c0"} for j in range(1, n)]
+        norm = normalize_request({"components": comps, "dependencies": deps})
+        rules = validate_ruleset(DEFAULT_RULESET)
+        if assess_normalized(norm, rules)["status"] != "conflict":
+            continue
+        choices = rem_mod.normalize_candidates(
+            {"components": {
+                "c%d" % i: [
+                    {"id": "q%d" % k,
+                     "expression": licenses_pool[int(rng.random() * len(licenses_pool))],
+                     "cost": int(rng.random() * 3)}
+                    for k in range(3)
+                ]
+                for i in range(n)
+            }},
+            norm, rules,
+        )
+        scale = 1
+        for opts in choices.values():
+            for opt in opts:
+                d = opt["cost"].denominator
+                scale = scale * d // _math.gcd(scale, d)
+        orig = rem_mod.MAX_REMEDIATION_COMBINATIONS
+        rem_mod.MAX_REMEDIATION_COMBINATIONS = 0
+        try:
+            mode_b, rel_b, fail_b = rem_mod._solve(norm, rules, choices, scale)
+        finally:
+            rem_mod.MAX_REMEDIATION_COMBINATIONS = orig
+        mode_e, rel_e, fail_e = rem_mod._solve(norm, rules, choices, scale)
+        key_b = None if rel_b is None else rel_b[0]
+        key_e = None if rel_e is None else rel_e[0]
+        if mode_b != "branch-and-bound" or (key_b,
+                None if fail_b is None else fail_b[0]) != (key_e,
+                None if fail_e is None else fail_e[0]):
+            mismatches += 1
+    check("remediation: branch-and-bound == exhaustive", mismatches == 0,
+          "%d mismatches" % mismatches)
 
 
 def run_compare_checks(call, check):

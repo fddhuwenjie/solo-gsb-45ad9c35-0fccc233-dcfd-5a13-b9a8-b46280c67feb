@@ -15,6 +15,7 @@ Endpoints:
     POST /v1/assessments/{id}/fulfillment-check
     POST /v1/assessments/{id}/obligation-schedule
     POST /v1/assessments/{id}/responsibility-plan
+    POST /v1/assessments/{id}/remediation-plan
     POST /v1/assessments/compare
 """
 
@@ -28,6 +29,7 @@ from urllib.parse import urlparse
 from .common import ClientError, ConflictError, NotFound, stable_hash
 from .compare import compare_assessments
 from .fulfillment import UnprocessableError, check_fulfillment
+from .remediation import RemediationConflict, plan_remediation
 from .responsibility import PartialPlanError, build_plan
 from .revisions import REVISION_ID_LEN
 from .rules import validate_ruleset
@@ -43,7 +45,7 @@ _REVISION_RE = re.compile(
 _ASSESS_RE = re.compile(
     r"^/v1/assessments(?:/([0-9a-f]{8,64})"
     r"(/(?:confirm|confirmation|fulfillment-check|obligation-schedule"
-    r"|responsibility-plan))?)?$"
+    r"|responsibility-plan|remediation-plan))?)?$"
 )
 
 
@@ -270,6 +272,20 @@ class Api:
             raise ClientError("request body must be a JSON object")
         return build_plan(body, result, aid)
 
+    # -- remediation plan ---------------------------------------------------
+
+    def remediation_plan(self, aid, body):
+        row = self.store.get_assessment(aid)
+        if row is None:
+            raise NotFound("assessment %r not found" % aid)
+        # plan_remediation verifies the pinned normalized request and
+        # rules snapshot itself and refuses (409) when it cannot prove
+        # them or the status is not "conflict" -- never falling back to
+        # current active rules.
+        if row["rules"] is None:
+            row["rules"] = self.store.recover_legacy_rules(aid)
+        return plan_remediation(row, body, aid)
+
     # -- comparison -----------------------------------------------------
 
     def compare(self, body):
@@ -387,6 +403,7 @@ def make_server(host, port, store):
                                 "POST /v1/assessments/{id}/fulfillment-check",
                                 "POST /v1/assessments/{id}/obligation-schedule",
                                 "POST /v1/assessments/{id}/responsibility-plan",
+                                "POST /v1/assessments/{id}/remediation-plan",
                                 "POST /v1/assessments/compare",
                             ],
                         },
@@ -434,11 +451,15 @@ def make_server(host, port, store):
                         return self._json(200, api.obligation_schedule(aid, self._body()))
                     if method == "POST" and aid is not None and sub == "/responsibility-plan":
                         return self._json(200, api.responsibility_plan(aid, self._body()))
+                    if method == "POST" and aid is not None and sub == "/remediation-plan":
+                        return self._json(200, api.remediation_plan(aid, self._body()))
 
                 raise NotFound("no route for %s %s" % (method, path))
             except UnprocessableError as exc:
                 return self._json(422, {"error": str(exc)})
             except PartialPlanError as exc:
+                return self._json(409, exc.payload)
+            except RemediationConflict as exc:
                 return self._json(409, exc.payload)
             except ClientError as exc:
                 return self._json(400, {"error": str(exc)})
