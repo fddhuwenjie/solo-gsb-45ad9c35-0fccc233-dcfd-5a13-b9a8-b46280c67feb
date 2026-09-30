@@ -28,7 +28,7 @@ python3 main.py
 数据持久化在 SQLite（容器内 `/data/app.db`，本地默认 `./data/app.db`，
 环境变量 `APP_DB` 可改）。
 
-自检（启动临时实例跑 294 项端到端检查）：
+自检（启动临时实例跑 330 项端到端检查）：
 
 ```bash
 python3 tests/selftest.py
@@ -52,6 +52,7 @@ python3 tests/selftest.py
 | POST | `/v1/assessments/{id}/fulfillment-check` | 履约材料/义务证据核算 |
 | POST | `/v1/assessments/{id}/obligation-schedule` | 义务截止日排期 |
 | POST | `/v1/assessments/{id}/responsibility-plan` | 义务责任分工（执行/复核） |
+| POST | `/v1/assessments/{id}/remediation-plan` | 冲突组件许可证整改规划（候选许可证 + 成本的全局求解） |
 | POST | `/v1/assessments/compare` | 两次核算的原子差异与最小归因对比 |
 
 ### 不可变修订与原子发布（含并发发布与回滚）
@@ -667,6 +668,149 @@ curl -sS -X POST \
   -H 'Content-Type: application/json' -d @people.json
 ```
 
+### 许可证整改规划 `POST /v1/assessments/{id}/remediation-plan`
+
+针对一个已持久化的 **`status: "conflict"` 核算**，为可调整组件提交候选替换
+许可证表达式（每个候选带**稳定 ID** 与**非负成本**），由服务在**全局**所有
+组件选项组合上求解：是否存在一组替换能消除全部冲突从而放行；存在则给出唯一
+最优的放行方案，不存在则返回 409 与唯一最佳失败方案。
+
+服务**只使用该核算持久化的规范化请求与规则快照**求解，绝不读取当前活动规则集：
+
+- 核算不存在 → **404**；核算不是 `conflict` 状态 → **409**（`reason:
+  "not-a-conflict"`）；
+- 核算的规则快照无法核验恢复（旧库记录、规则集事后被删除或同名覆盖、或源于
+  从未持久化的内联规则）→ **409**（`reason: "snapshot-unverifiable"`），
+  **绝不改用当前活动规则**给出可能失真的整改方案；
+- 候选非法（表达式无法解析、引用了本核算不存在的组件、许可证/例外在规则快照
+  中无规则、成本为负或非有限值、同一组件内候选 ID 重复）→ 整批 **422**，
+  即使同批另有合法候选也**不产生任何部分结论**；请求体结构性错误（缺字段、
+  类型错误）返回 **400**。
+
+每个组件的可选项恒为：零成本保留原表达式（隐式 “keep”，响应里
+`candidate_id` 为 `null`）+ 为其提交的候选。未提交候选的组件只能保留原样。
+候选表达式支持完整的 SPDX 风格 `AND` / `OR` / `WITH`；是否算“变更”按解析后
+的 OR 分支叶子集合判定（仅写法不同、分支集合相同的候选 `changed=false`）。
+
+请求体：
+
+```json
+{
+  "candidates": [
+    {"id": "ap-to-mit", "component": "ap", "license": "MIT", "cost": 5},
+    {"id": "ap-to-isc", "component": "ap", "license": "ISC", "cost": 9}
+  ]
+}
+```
+
+- `candidates[]`：候选数组（允许为空数组，表示只能零成本保留原样）。
+  `id` 在**同一组件内**稳定唯一（不同组件可复用同一 id）；`component` 必须是
+  该核算中存在的组件 id；`license` 是候选许可证表达式；`cost` 是非负数值
+  （省略视为 `0`，可为小数，内部按精确有理数计算）。
+
+**求解规则（全局最优，禁止逐组件贪心/固定截断）**。每个选项组合都用**绑定的
+规则快照**对整改后的规范化请求重新核算；在所有能放行（重算结果 `status: ok`）
+的组合上，按以下字典序目标取最小，方案因此唯一：
+
+1. 总成本最小（各组件所选候选成本之和，保留原样成本为 0）；
+2. 变更组件数最少（表达式真正改变的组件数）；
+3. 按组件 ID 升序的 `(组件 ID, 候选 ID)` 序列字典序最小（保留原样以空串参与
+   比较，故排在任何真实候选 ID 之前）。
+
+放行方案返回 **200**，包含：
+
+- `replacements`：替换清单（仅含真正变更的组件；每项给出 `component`、
+  `candidate_id`、`from`/`to` 与该候选 `cost`）；
+- `choices`：每个被提交候选的组件最终所选（含保留原样 `candidate_id: null`
+  及 `changed`、`cost`）；
+- `adopted` / `artifact_obligations` / `components`：按整改后请求**重算的
+  采用分支、制品义务与逐组件义务**（与一次普通放行核算完全一致）；`result`
+  为完整重算结果；
+- `total_cost`、`changed_components`、`selection_mode`（`exhaustive` /
+  `branch-and-bound`，两路径结果完全一致）与 `remediation_hash`。
+
+```json
+{
+  "assessment_id": "…",
+  "release": true,
+  "selection_mode": "exhaustive",
+  "total_cost": 5,
+  "changed_components": 1,
+  "replacements": [
+    {"component": "ap", "candidate_id": "ap-to-mit",
+     "from": "Apache-2.0", "to": "MIT", "cost": 5}
+  ],
+  "choices": [
+    {"component": "ap", "candidate_id": "ap-to-mit", "changed": true, "cost": 5}
+  ],
+  "adopted": {"ap": "MIT", "app": "MIT", "gpl": "GPL-2.0-only"},
+  "artifact_obligations": ["attribution", "license-text", "same-license", "source-offer"],
+  "components": [ … ],
+  "result": { "status": "ok", … },
+  "remediation_hash": "…"
+}
+```
+
+**无方案可放行时返回 409**，仍按唯一目标给出**最佳失败方案**——先让剩余冲突
+组件数最少，再总成本最小，再按 `(组件 ID, 候选 ID)` 序列字典序。响应与放行
+方案同形（`release: false`、`reason: "no-releasable-assignment"`），并额外给出：
+
+- `conflicting_components`：最佳失败方案下重算的最小冲突组件集；
+- `conflicts` / `confirmed_subgraph`：重算结果中的冲突明细与已确认子图；
+- `conflict_explanation`：逐条冲突的人类可读解释；
+- `remediation_hash`：失败方案同样有稳定哈希。
+
+例如把 `ap` 改成 `GPL-3.0-only` 仍与 `gpl` 的 `GPL-2.0-only` 不兼容，冲突组件
+集与零成本保留原样相同，则唯一最佳失败方案选择零成本保留，而**不是**花费
+成本却毫无改善的候选。
+
+**确定性与幂等**：候选数组与组件的输入顺序（含 JSON 键序）不影响任何选择、
+解释或 `remediation_hash`；同一核算重复规划结果逐字节一致，规划本身不修改
+已存核算（其 `status` 与 `summary_hash` 保持不变）。整改求解在选项组合空间不
+超过 4096 时穷举；更大空间对“是否存在无冲突选择”启用完备分支定界（复用核算
+求解器的保证冲突下界，只剪除被证明不可能更优的子树），证明全部冲突时再以完备
+枚举求唯一最佳失败方案——两路径与穷举结果完全一致；问题本身 NP 难，病态实例
+的失败枚举耗时可能随组件数指数增长，服务绝不以近似结论冒充精确解。
+
+可执行示例（端到端）：
+
+```bash
+# 1) 制造一个 Apache-2.0 与 GPL-2.0-only 在同一组合作品中冲突的核算
+AID=$(curl -sS -X POST "$BASE/v1/assessments" -H 'Content-Type: application/json' -d '{
+  "components": [
+    {"id": "app", "license": "MIT"},
+    {"id": "gpl", "license": "GPL-2.0-only", "linkage": "static"},
+    {"id": "ap",  "license": "Apache-2.0",     "linkage": "static"}
+  ],
+  "dependencies": [{"from":"app","to":"gpl"},{"from":"app","to":"ap"}]
+}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+
+# 2) 为冲突组件 ap 提交候选（MIT 成本 5 / ISC 成本 9），全局选出可放行的最优整改
+curl -sS -X POST "$BASE/v1/assessments/$AID/remediation-plan" \
+  -H 'Content-Type: application/json' -d '{
+    "candidates": [
+      {"id":"ap-to-mit","component":"ap","license":"MIT","cost":5},
+      {"id":"ap-to-isc","component":"ap","license":"ISC","cost":9}
+    ]}'
+# 200 -> total_cost=5, replacements=[{component:"ap", candidate_id:"ap-to-mit",
+#         from:"Apache-2.0", to:"MIT", cost:5}], result.status="ok"
+
+# 3) 引用不存在的组件 / 非法表达式 -> 整批 422，无部分结论
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST \
+  "$BASE/v1/assessments/$AID/remediation-plan" \
+  -H 'Content-Type: application/json' \
+  -d '{"candidates":[{"id":"x","component":"ghost","license":"MIT"}]}'
+# 422
+
+# 4) 没有任何候选能消除冲突 -> 409，附带唯一最佳失败方案与冲突解释
+curl -sS -X POST "$BASE/v1/assessments/$AID/remediation-plan" \
+  -H 'Content-Type: application/json' \
+  -d '{"candidates":[{"id":"still-gpl3","component":"ap",
+       "license":"GPL-3.0-only","cost":2}]}'
+# 409 -> reason:"no-releasable-assignment", release:false,
+#        conflicting_components:["ap","app","gpl"], total_cost:0, remediation_hash:"…"
+```
+
 ### 核算对比 `POST /v1/assessments/compare`
 
 比较两次已持久化的核算（各自的**规范化请求 + 规则快照**），回答"目标版本
@@ -823,9 +967,10 @@ app/fulfillment.py    履约材料核算：义务实例展开、all/any 证据�
 app/schedule.py       义务截止日排期：RFC 3339/IANA 时区解析、日历日/工作日偏移、沿无环依赖反向收紧与收紧链还原
 app/responsibility.py 责任分工：责任项展开（制品级/组件级）、人员资格/容量/成本规范化、全局最优分工（穷举 + 最小费用流界的完备分支定界）、409 最佳部分方案与原因
 app/compare.py        核算对比：原子差异分解（稳定编号）、反事实回滚与全局最小归因集（按大小递增、ID 字典序完备枚举，非法中间状态不计命中）
+app/remediation.py    冲突整改规划：候选许可证/成本规范化与全局求解（成本、变更组件数、组件/候选 ID 序列字典序；穷举 + 复用求解器下界的完备分支定界）、409 唯一最佳失败方案与冲突解释
 app/store.py          SQLite 持久化（WAL，写锁）、规则快照绑定与旧库核验式迁移、不可变修订/CAS 激活/激活审计的事务实现
 app/server.py         ThreadingHTTPServer JSON 路由
-tests/selftest.py     294 项端到端自检（含草稿/首版发布门禁、并发发布与回滚）
+tests/selftest.py     330 项端到端自检（含草稿/首版发布门禁、并发发布与回滚、冲突整改规划及穷举/分支定界等价 fuzz）
 Dockerfile / docker-compose.yml / .dockerignore
 ```
 

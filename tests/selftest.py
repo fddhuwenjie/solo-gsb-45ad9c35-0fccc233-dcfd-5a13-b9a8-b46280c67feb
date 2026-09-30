@@ -748,6 +748,359 @@ def run_checks():
     # -- assessment comparison checks ----------------------------------------
     run_compare_checks(call, check)
 
+    # -- remediation plan checks ---------------------------------------------
+    run_remediation_checks(call, check)
+
+
+def run_remediation_checks(call, check):
+    """Component license remediation planning for conflict assessments."""
+    # baseline conflict: app merges GPL-2.0-only and Apache-2.0
+    base = {
+        "product": "rem",
+        "components": [
+            {"id": "app", "license": "MIT"},
+            {"id": "gpl", "license": "GPL-2.0-only", "linkage": "static"},
+            {"id": "ap", "license": "Apache-2.0", "linkage": "static"},
+            {"id": "docs", "license": "CC0-1.0"},
+        ],
+        "dependencies": [
+            {"from": "app", "to": "gpl"},
+            {"from": "app", "to": "ap"},
+        ],
+    }
+    code, body = call("POST", "/v1/assessments", base)
+    aid = body.get("id")
+    check("remediation: baseline is conflict",
+          code == 200 and body["result"]["status"] == "conflict")
+
+    # -- releasable plan -----------------------------------------------------
+    plan = {"candidates": [
+        {"id": "to-isc", "component": "ap", "license": "ISC", "cost": 9},
+        {"id": "to-mit", "component": "ap", "license": "MIT", "cost": 5},
+        {"id": "noop", "component": "docs", "license": "CC0-1.0", "cost": 0},
+    ]}
+    code, p = call("POST", "/v1/assessments/%s/remediation-plan" % aid, plan)
+    check("remediation: releasable plan 200", code == 200, json.dumps(p)[:200])
+    check("remediation: release true", p.get("release") is True)
+    check("remediation: cheapest fix chosen",
+          p.get("total_cost") == 5 and p.get("changed_components") == 1
+          and [(r["component"], r["candidate_id"]) for r in p.get("replacements", [])]
+          == [("ap", "to-mit")],
+          str(p.get("replacements")))
+    check("remediation: replacement from/to",
+          p["replacements"][0]["from"] == "Apache-2.0"
+          and p["replacements"][0]["to"] == "MIT"
+          and p["replacements"][0]["cost"] == 5)
+    check("remediation: no-op candidate not counted as change",
+          all(not c["changed"] for c in p["choices"] if c["component"] == "docs")
+          and [r["component"] for r in p["replacements"]] == ["ap"])
+    res = p.get("result", {})
+    check("remediation: recomputed result is ok with adopted branches",
+          res.get("status") == "ok"
+          and p.get("adopted", {}).get("ap") == "MIT"
+          and p.get("adopted", {}).get("gpl") == "GPL-2.0-only")
+    check("remediation: obligations returned",
+          "source-offer" in p.get("artifact_obligations", [])
+          and isinstance(p.get("components"), list))
+    check("remediation: hash present", isinstance(p.get("remediation_hash"), str)
+          and len(p.get("remediation_hash", "")) == 64)
+    check("remediation: candidates echoed canonically",
+          {c["candidate_id"] for c in p["candidates"]} == {"to-isc", "to-mit", "noop"})
+
+    # -- order invariance (candidate array order, field order irrelevant) ----
+    h1 = p["remediation_hash"]
+    code, p2 = call("POST", "/v1/assessments/%s/remediation-plan" % aid,
+                    {"candidates": list(reversed(plan["candidates"]))})
+    check("remediation: candidate order does not change hash",
+          code == 200 and p2["remediation_hash"] == h1
+          and p2["replacements"] == p["replacements"])
+
+    # -- cost decides over id; changed-count decides over cost --------------
+    cheap = {"candidates": [
+        {"id": "zzz-cheap", "component": "ap", "license": "MIT", "cost": 1},
+        {"id": "aaa-pricey", "component": "ap", "license": "ISC", "cost": 8}]}
+    code, pc = call("POST", "/v1/assessments/%s/remediation-plan" % aid, cheap)
+    check("remediation: lower cost wins over smaller id",
+          [r["candidate_id"] for r in pc["replacements"]] == ["zzz-cheap"])
+
+    tie = {"candidates": [
+        {"id": "zzz", "component": "ap", "license": "MIT", "cost": 3},
+        {"id": "aaa", "component": "ap", "license": "ISC", "cost": 3}]}
+    code, pt = call("POST", "/v1/assessments/%s/remediation-plan" % aid, tie)
+    check("remediation: candidate id lexicographic tie break",
+          [r["candidate_id"] for r in pt["replacements"]] == ["aaa"])
+
+    # changed-component count is the second objective: a candidate that keeps
+    # the same expression (CC0 == CC0) at zero cost beats changing the docs
+    # component even though both cost zero
+    multi = {"candidates": [
+        {"id": "fix-ap", "component": "ap", "license": "MIT", "cost": 0},
+        {"id": "touch-docs", "component": "docs", "license": "Unlicense", "cost": 0}]}
+    code, pm = call("POST", "/v1/assessments/%s/remediation-plan" % aid, multi)
+    check("remediation: minimize changed component count",
+          pm["changed_components"] == 1
+          and [r["component"] for r in pm["replacements"]] == ["ap"])
+
+    # -- no release: unique best failing assignment + explanation ------------
+    only_gpl = {"candidates": [
+        {"id": "still-gpl3", "component": "ap",
+         "license": "GPL-3.0-only", "cost": 2}]}
+    code, pf = call("POST", "/v1/assessments/%s/remediation-plan" % aid, only_gpl)
+    check("remediation: no release -> 409", code == 409)
+    # Changing ap to GPL-3.0-only leaves the very same conflicting set
+    # (ap/app/gpl: GPL-3.0-only is still incompatible with GPL-2.0-only), so
+    # the zero-cost keep option wins the unique best failure; the paid but
+    # equally-failing candidate is correctly rejected.
+    check("remediation: failure payload",
+          pf.get("release") is False
+          and pf.get("reason") == "no-releasable-assignment"
+          and pf.get("total_cost") == 0
+          and pf.get("conflicting_components") == ["ap", "app", "gpl"]
+          and pf.get("choices", [{}])[0]["candidate_id"] is None
+          and pf.get("choices", [{}])[0]["changed"] is False)
+    check("remediation: failure explanation + recomputed branches",
+          pf.get("conflict_explanation")
+          and "incompatible-licenses" in pf["conflict_explanation"][0]
+          and pf.get("confirmed_subgraph", {}).get("components")
+          and "remediation_hash" in pf)
+    hf = pf["remediation_hash"]
+    code, pf2 = call("POST", "/v1/assessments/%s/remediation-plan" % aid,
+                     {"candidates": list(reversed(only_gpl["candidates"]))})
+    check("remediation: failure hash order invariant",
+          code == 409 and pf2["remediation_hash"] == hf)
+
+    # A *genuinely* smaller conflicting set is worth paying for: swapping
+    # gpl->GPL-3.0-only makes it compatible with the kept Apache-2.0 and
+    # removes the only conflict (cost 1), beating the zero-cost keep that
+    # leaves all three components conflicting.
+    paid_smaller = {"candidates": [
+        {"id": "gpl3", "component": "gpl", "license": "GPL-3.0-only", "cost": 1}]}
+    code, pps = call("POST", "/v1/assessments/%s/remediation-plan" % aid, paid_smaller)
+    check("remediation: paid smaller-conflict set releases",
+          code == 200 and pps["total_cost"] == 1
+          and [(r["component"], r["candidate_id"]) for r in pps["replacements"]]
+          == [("gpl", "gpl3")])
+
+    # Multiple components must change together for a release: two
+    # independent incompatibilities, each only fixable at its own component.
+    two = {
+        "components": [
+            {"id": "app", "license": "MIT"},
+            {"id": "g2", "license": "GPL-2.0-only", "linkage": "static"},
+            {"id": "g3", "license": "GPL-3.0-only", "linkage": "static"},
+            {"id": "ap2", "license": "Apache-2.0", "linkage": "static"},
+        ],
+        "dependencies": [{"from": "app", "to": c} for c in ("g2", "g3", "ap2")],
+    }
+    code, tb = call("POST", "/v1/assessments", two)
+    two_aid = tb["id"]
+    check("remediation: two independent conflicts baseline",
+          tb["result"]["status"] == "conflict")
+    two_plan = {"candidates": [
+        {"id": "g3-mit", "component": "g3", "license": "MIT", "cost": 1},
+        {"id": "ap2-mit", "component": "ap2", "license": "MIT", "cost": 1}]}
+    code, tp = call("POST",
+                    "/v1/assessments/%s/remediation-plan" % two_aid, two_plan)
+    check("remediation: both components replaced to release",
+          code == 200 and tp["total_cost"] == 2 and tp["changed_components"] == 2
+          and sorted(r["component"] for r in tp["replacements"]) == ["ap2", "g3"])
+    # offering only one fix leaves a (smaller) conflict -> best failure 409
+    code, tf = call("POST", "/v1/assessments/%s/remediation-plan" % two_aid,
+                    {"candidates": [two_plan["candidates"][0]]})
+    check("remediation: single fix of two still fails 409",
+          code == 409 and tf["release"] is False
+          and len(tf["conflicting_components"]) < len(tb["result"]["conflicting_components"]))
+
+    # -- 422: illegal candidates never produce partial conclusions -----------
+    code, e1 = call("POST", "/v1/assessments/%s/remediation-plan" % aid,
+                    {"candidates": [{"id": "x", "component": "ghost",
+                                     "license": "MIT"}]})
+    check("remediation: unknown component -> 422", code == 422)
+    code, e2 = call("POST", "/v1/assessments/%s/remediation-plan" % aid,
+                    {"candidates": [{"id": "x", "component": "ap",
+                                     "license": "MIT OR OR"}]})
+    check("remediation: invalid expression -> 422", code == 422)
+    code, e3 = call("POST", "/v1/assessments/%s/remediation-plan" % aid,
+                    {"candidates": [{"id": "x", "component": "ap",
+                                     "license": "NoSuch-9.9"}]})
+    check("remediation: missing rule -> 422", code == 422)
+    code, e4 = call("POST", "/v1/assessments/%s/remediation-plan" % aid,
+                    {"candidates": [{"id": "x", "component": "ap",
+                                     "license": "MIT", "cost": -1}]})
+    check("remediation: negative cost -> 422", code == 422)
+    code, e5 = call("POST", "/v1/assessments/%s/remediation-plan" % aid,
+                    {"candidates": [
+                        {"id": "x", "component": "ap", "license": "MIT"},
+                        {"id": "x", "component": "ap", "license": "ISC"}]})
+    check("remediation: duplicate candidate id -> 422", code == 422)
+    # one bad apple invalidates the whole request even alongside a good fix
+    code, e6 = call("POST", "/v1/assessments/%s/remediation-plan" % aid,
+                    {"candidates": [
+                        {"id": "good", "component": "ap", "license": "MIT", "cost": 1},
+                        {"id": "bad", "component": "ghost", "license": "MIT"}]})
+    check("remediation: mixed valid/invalid batch -> 422, no partial", code == 422)
+    # same candidate id on different components is allowed (id per component)
+    code, ok_same = call("POST", "/v1/assessments/%s/remediation-plan" % aid,
+                         {"candidates": [
+                             {"id": "fix", "component": "ap", "license": "MIT", "cost": 1},
+                             {"id": "fix", "component": "docs", "license": "CC0-1.0", "cost": 1}]})
+    check("remediation: candidate id scoped per component", code == 200
+          and ok_same["total_cost"] == 1)
+
+    # -- 400: structural envelope errors -------------------------------------
+    code, b1 = call("POST", "/v1/assessments/%s/remediation-plan" % aid,
+                    {"candidates": "nope"})
+    check("remediation: malformed candidates -> 400", code == 400)
+    code, b2 = call("POST", "/v1/assessments/%s/remediation-plan" % aid,
+                    {"candidates": [{"id": "x", "component": "ap"}]})
+    check("remediation: missing license -> 400", code == 400)
+
+    # -- state gates ---------------------------------------------------------
+    ok_req = {"components": [{"id": "solo", "license": "MIT"}]}
+    code, ob = call("POST", "/v1/assessments", ok_req)
+    ok_id = ob["id"]
+    code, g = call("POST", "/v1/assessments/%s/remediation-plan" % ok_id,
+                   {"candidates": []})
+    check("remediation: non-conflict assessment -> 409",
+          code == 409 and g.get("reason") == "not-a-conflict")
+    code, g = call("POST", "/v1/assessments/%s/remediation-plan" % ("f" * 32),
+                   {"candidates": []})
+    check("remediation: unknown assessment -> 404", code == 404)
+
+    # -- stateless: assessment row untouched by planning ---------------------
+    code, row_after = call("GET", "/v1/assessments/%s" % aid)
+    check("remediation: planning does not mutate the assessment",
+          row_after.get("result", {}).get("status") == "conflict"
+          and row_after.get("result", {}).get("summary_hash")
+          == body["result"]["summary_hash"])
+
+    # -- empty candidate list is legal: only zero-cost keep available --------
+    code, pe = call("POST", "/v1/assessments/%s/remediation-plan" % aid,
+                    {"candidates": []})
+    check("remediation: empty candidates -> 409 keep-only best failure",
+          code == 409 and pe.get("total_cost") == 0
+          and all(c["candidate_id"] is None for c in pe.get("choices", [])))
+
+    # -- solver-level equivalence: exhaustive == branch-and-bound ------------
+    run_remediation_fuzz(check)
+
+
+def run_remediation_fuzz(check):
+    """Random remediation instances: the exhaustive and branch-and-bound
+    paths must return identical plans (release and failure alike)."""
+    import random
+    from fractions import Fraction
+    import itertools
+    from app import remediation as rem
+    from app.expression import alternatives, parse
+
+    rules = validate_ruleset(DEFAULT_RULESET)
+    lics = ["MIT", "ISC", "Apache-2.0", "GPL-2.0-only", "GPL-3.0-only",
+            "LGPL-2.1-only", "MPL-2.0", "CC0-1.0"]
+    rng = random.Random(20260930)
+
+    def expr():
+        if rng.random() < 0.7:
+            return rng.choice(lics)
+        return " OR ".join(rng.sample(lics, rng.randint(2, 3)))
+
+    def alts_of(e):
+        return sorted({
+            tuple(sorted({(l, x or "") for l, x in a}))
+            for a in alternatives(parse(e))
+        })
+
+    mismatches = 0
+    for _ in range(120):
+        n = rng.randint(2, 5)
+        ids = ["c%d" % i for i in range(n)]
+        comps = [{"id": c, "name": c, "version": "", "license": expr(),
+                  "linkage": rng.choice(["static", "dynamic", "process"])}
+                 for c in ids]
+        deps = [{"from": ids[i], "to": ids[rng.randrange(i)]}
+                for i in range(1, n) if rng.random() < 0.7]
+        norm = {"product": "", "distribution": rng.choice(["binary", "saas"]),
+                "components": comps, "dependencies": deps}
+        raw_cands = []
+        for cid in ids:
+            for k in range(rng.randint(0, 2)):
+                tag = "%s-v%d" % (cid, k)
+                if any(x[1] == tag and x[0] == cid for x in raw_cands):
+                    continue
+                raw_cands.append((cid, tag, expr(), rng.choice([0, 1, 3])))
+
+        # independent brute-force oracle
+        comp_map = {c["id"]: c for c in comps}
+        options = {c: [(None, comp_map[c]["license"])] for c in ids}
+        for cid, tag, e, c in raw_cands:
+            options[cid].append((tag, e))
+        keep_sig = {c: frozenset(alts_of(comp_map[c]["license"])) for c in ids}
+        adjusted = sorted({cid for cid, _, _, _ in raw_cands})
+        rel = fail = None
+        for combo in itertools.product(*[options[c] for c in adjusted]):
+            chosen = dict(zip(adjusted, combo))
+            cost_of = {(cid, tag): k for cid, tag, _, k in raw_cands}
+            total = Fraction(sum(
+                cost_of[(cid, chosen[cid][0])]
+                for cid in adjusted if chosen[cid][0] is not None
+            ))
+            changed = sum(
+                1 for cid in adjusted
+                if chosen[cid][0] is not None
+                and frozenset(alts_of(chosen[cid][1])) != keep_sig[cid]
+            )
+            mod = dict(norm)
+            mod["components"] = [
+                dict(comp_map[cid],
+                     license=chosen[cid][1] if cid in chosen
+                     else comp_map[cid]["license"])
+                for cid in ids
+            ]
+            out = assess_normalized(mod, rules)
+            seq = tuple((cid, chosen[cid][0] or "") for cid in adjusted)
+            if out["status"] == "ok":
+                key = (total, changed, seq)
+                if rel is None or key < rel[0]:
+                    rel = (key, out)
+            else:
+                ncc = len(out.get("conflicting_components", []))
+                key = (ncc, total, seq)
+                if fail is None or key < fail[0]:
+                    fail = (key, out)
+
+        body = {"candidates": [
+            {"id": t, "component": cid, "license": e, "cost": k}
+            for cid, t, e, k in raw_cands]}
+        base = assess_normalized(norm, rules)
+        row = {"id": "f" * 32, "request": norm, "rules": rules,
+               "result": base, "ruleset": "default"}
+
+        def run(cap):
+            old = rem.MAX_OPTION_ASSIGNMENTS
+            rem.MAX_OPTION_ASSIGNMENTS = cap
+            try:
+                try:
+                    return "ok", rem.build_remediation(row, body)
+                except rem.NoReleaseError as ex:
+                    return "fail", ex.payload
+            finally:
+                rem.MAX_OPTION_ASSIGNMENTS = old
+
+        for cap in (10 ** 9, 1):
+            kind, p = run(cap)
+            if rel is not None:
+                if not (kind == "ok" and p["total_cost"] == rel[0][0]
+                        and p["changed_components"] == rel[0][1]):
+                    mismatches += 1
+            else:
+                if not (kind == "fail"
+                        and p["total_cost"] == fail[0][1]
+                        and p["conflicting_components"]
+                        == fail[1]["conflicting_components"]):
+                    mismatches += 1
+    check("remediation fuzz: exhaustive == branch-and-bound == oracle",
+          mismatches == 0, "%d mismatches" % mismatches)
+
 
 def run_deep_expression_checks():
     """Deeply nested SPDX expressions (hundreds of parenthesis/operator

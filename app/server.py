@@ -15,6 +15,7 @@ Endpoints:
     POST /v1/assessments/{id}/fulfillment-check
     POST /v1/assessments/{id}/obligation-schedule
     POST /v1/assessments/{id}/responsibility-plan
+    POST /v1/assessments/{id}/remediation-plan
     POST /v1/assessments/compare
 """
 
@@ -28,6 +29,7 @@ from urllib.parse import urlparse
 from .common import ClientError, ConflictError, NotFound, stable_hash
 from .compare import compare_assessments
 from .fulfillment import UnprocessableError, check_fulfillment
+from .remediation import NoReleaseError, build_remediation
 from .responsibility import PartialPlanError, build_plan
 from .revisions import REVISION_ID_LEN
 from .rules import validate_ruleset
@@ -43,7 +45,7 @@ _REVISION_RE = re.compile(
 _ASSESS_RE = re.compile(
     r"^/v1/assessments(?:/([0-9a-f]{8,64})"
     r"(/(?:confirm|confirmation|fulfillment-check|obligation-schedule"
-    r"|responsibility-plan))?)?$"
+    r"|responsibility-plan|remediation-plan))?)?$"
 )
 
 
@@ -270,7 +272,50 @@ class Api:
             raise ClientError("request body must be a JSON object")
         return build_plan(body, result, aid)
 
-    # -- comparison -----------------------------------------------------
+    # -- remediation plan --------------------------------------------------
+
+    def remediation_plan(self, aid, body):
+        row = self.store.get_assessment(aid)
+        if row is None:
+            raise NotFound("assessment %r not found" % aid)
+        result = row["result"]
+        if result.get("status") != "conflict":
+            # Remediation planning is defined for conflicting accounting
+            # only; an already releasable assessment has nothing to fix.
+            raise ConflictError(
+                "assessment status is %r; remediation plans require "
+                "status 'conflict'" % result.get("status"),
+                {"reason": "not-a-conflict", "status": result.get("status")},
+            )
+        # The plan must be solved with the exact normalized request and
+        # rules snapshot the assessment persisted.  Newer rows always
+        # carry the pinned snapshot; pre-upgrade rows are accepted only
+        # when their rules can be verified and restored.  A deleted /
+        # overwritten ruleset or a legacy inline-rule request can never
+        # be reconstructed -- refuse 409 rather than solving against the
+        # currently active rules.
+        rules = row["rules"]
+        if rules is None:
+            rules = self.store.recover_legacy_rules(aid)
+            row = self.store.get_assessment(aid)
+        if rules is None:
+            if not row["ruleset"]:
+                reason = (
+                    "the assessment used inline rules that were never persisted; "
+                    "re-submit the assessment to bind a rules snapshot"
+                )
+            else:
+                reason = (
+                    "the original ruleset %r can no longer be verified "
+                    "(ruleset deleted or overwritten since the assessment)"
+                    % row["ruleset"]
+                )
+            raise ConflictError(
+                "cannot plan remediation for assessment %r: %s" % (aid, reason),
+                {"reason": "snapshot-unverifiable"},
+            )
+        row["rules"] = rules
+        return build_remediation(row, body)
 
     def compare(self, body):
         if not isinstance(body, dict):
@@ -387,6 +432,7 @@ def make_server(host, port, store):
                                 "POST /v1/assessments/{id}/fulfillment-check",
                                 "POST /v1/assessments/{id}/obligation-schedule",
                                 "POST /v1/assessments/{id}/responsibility-plan",
+                                "POST /v1/assessments/{id}/remediation-plan",
                                 "POST /v1/assessments/compare",
                             ],
                         },
@@ -434,10 +480,14 @@ def make_server(host, port, store):
                         return self._json(200, api.obligation_schedule(aid, self._body()))
                     if method == "POST" and aid is not None and sub == "/responsibility-plan":
                         return self._json(200, api.responsibility_plan(aid, self._body()))
+                    if method == "POST" and aid is not None and sub == "/remediation-plan":
+                        return self._json(200, api.remediation_plan(aid, self._body()))
 
                 raise NotFound("no route for %s %s" % (method, path))
             except UnprocessableError as exc:
                 return self._json(422, {"error": str(exc)})
+            except NoReleaseError as exc:
+                return self._json(409, exc.payload)
             except PartialPlanError as exc:
                 return self._json(409, exc.payload)
             except ClientError as exc:
